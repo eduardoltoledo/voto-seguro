@@ -1,0 +1,153 @@
+# Voto Seguro – ambiente completo:  ./gerar-env.sh && docker compose up --build
+# Acesso: https://localhost:8443  (certificado autoassinado de demonstração)
+
+x-backend: &backend
+  build: ./backend
+  restart: unless-stopped
+  networks: [interna]
+  depends_on:
+    init-db: { condition: service_completed_successfully }
+  environment: &backend-env
+    APP_ENV: production
+    DATABASE_URL: postgresql+psycopg2://${APP_DB_USER}:${APP_DB_PASSWORD:?APP_DB_PASSWORD vazio - rode ./gerar-env.sh}@db-primary:5432/${POSTGRES_DB}
+    DATABASE_REPLICA_URL: postgresql+psycopg2://${APP_DB_USER}:${APP_DB_PASSWORD:?APP_DB_PASSWORD vazio - rode ./gerar-env.sh}@db-replica:5432/${POSTGRES_DB}
+    AES_KEY: ${AES_KEY:?AES_KEY vazio - rode ./gerar-env.sh}
+    INDEX_KEY: ${INDEX_KEY:?INDEX_KEY vazio - rode ./gerar-env.sh}
+    JWT_KEY: ${JWT_KEY:?JWT_KEY vazio - rode ./gerar-env.sh}
+    BOLETIM_KEY: ${BOLETIM_KEY:?BOLETIM_KEY vazio - rode ./gerar-env.sh}
+    COOKIE_SECURE: "true"
+    TRUST_PROXY: "true"
+    BACKEND_NODES: http://backend1:8000,http://backend2:8000
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  # ---------------- Banco de dados: primário + standby (streaming replication)
+  db-primary:
+    image: postgres:16
+    restart: unless-stopped
+    networks: [interna]
+    command: >
+      postgres -c wal_level=replica -c max_wal_senders=5 -c max_replication_slots=5
+               -c hot_standby=on -c listen_addresses=* -c password_encryption=scram-sha-256
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD vazio - rode ./gerar-env.sh}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:?REPLICATION_PASSWORD vazio - rode ./gerar-env.sh}
+      APP_DB_USER: ${APP_DB_USER}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?APP_DB_PASSWORD vazio - rode ./gerar-env.sh}
+    volumes:
+      - pgprimary:/var/lib/postgresql/data
+      - ./db/primary-init.sh:/docker-entrypoint-initdb.d/10-primary-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  db-replica:
+    image: postgres:16
+    restart: unless-stopped
+    networks: [interna]
+    entrypoint: ["bash", "/replica-entrypoint.sh"]   # via bash: não depende do bit de execução (Windows)
+    environment:
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:?REPLICATION_PASSWORD vazio - rode ./gerar-env.sh}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD vazio - rode ./gerar-env.sh}
+    volumes:
+      - pgreplica:/var/lib/postgresql/data
+      - ./db/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+    depends_on:
+      db-primary: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # ---------------- Cria o esquema, triggers append-only e privilégios (executa e termina)
+  init-db:
+    build: ./backend
+    networks: [interna]
+    command: ["python", "-m", "scripts.init_db"]
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD vazio - rode ./gerar-env.sh}@db-primary:5432/${POSTGRES_DB}
+      APP_DB_USER: ${APP_DB_USER}
+      AES_KEY: ${AES_KEY:?AES_KEY vazio - rode ./gerar-env.sh}
+      INDEX_KEY: ${INDEX_KEY:?INDEX_KEY vazio - rode ./gerar-env.sh}
+      JWT_KEY: ${JWT_KEY:?JWT_KEY vazio - rode ./gerar-env.sh}
+      BOLETIM_KEY: ${BOLETIM_KEY:?BOLETIM_KEY vazio - rode ./gerar-env.sh}
+      SEED_DEMO: ${SEED_DEMO:-false}
+    depends_on:
+      db-primary: { condition: service_healthy }
+
+  # ---------------- API: instâncias stateless atrás do balanceador
+  backend1:
+    <<: *backend
+    environment: { <<: *backend-env, INSTANCE_ID: backend1 }
+  backend2:
+    <<: *backend
+    environment: { <<: *backend-env, INSTANCE_ID: backend2 }
+
+  # ---------------- Borda: Nginx (TLS 1.3, balanceamento, rate limiting) + SPA React
+  edge:
+    build:
+      context: .
+      dockerfile: edge/Dockerfile
+    restart: unless-stopped
+    networks: [interna, publica]
+    ports:
+      - "${HTTPS_PORT:-8443}:443"
+      - "${HTTP_PORT:-8080}:80"
+    environment:
+      HTTPS_PORT: ${HTTPS_PORT:-8443}
+    volumes:
+      - certs:/etc/nginx/certs
+    depends_on: [backend1, backend2]
+
+  # ---------------- Backup automático + teste de restauração
+  backup:
+    build:
+      context: .
+      dockerfile: backup/Dockerfile
+    restart: unless-stopped
+    networks: [interna]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD vazio - rode ./gerar-env.sh}
+      POSTGRES_DB: ${POSTGRES_DB}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-3600}
+    volumes:
+      - backups:/backups
+    depends_on:
+      init-db: { condition: service_completed_successfully }
+
+  # ---------------- Demonstração de fraude (só sob demanda):  docker compose --profile demo run --rm demo-fraude
+  demo-fraude:
+    profiles: [demo]
+    build: ./backend
+    networks: [interna]
+    command: ["python", "-m", "scripts.demo_fraude", "http://backend1:8000"]
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD vazio - rode ./gerar-env.sh}@db-primary:5432/${POSTGRES_DB}  # dono do banco: simula o DBA malicioso
+      AES_KEY: ${AES_KEY:?AES_KEY vazio - rode ./gerar-env.sh}
+      INDEX_KEY: ${INDEX_KEY:?INDEX_KEY vazio - rode ./gerar-env.sh}
+      JWT_KEY: ${JWT_KEY:?JWT_KEY vazio - rode ./gerar-env.sh}
+      BOLETIM_KEY: ${BOLETIM_KEY:?BOLETIM_KEY vazio - rode ./gerar-env.sh}
+    depends_on: [backend1, backend2]
+
+networks:
+  interna:
+    internal: true        # sem acesso à internet; só o edge é exposto
+  publica: {}
+
+volumes:
+  pgprimary:
+  pgreplica:
+  backups:
+  certs:

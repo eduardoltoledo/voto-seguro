@@ -1,0 +1,84 @@
+# Este arquivo vai para /etc/nginx/conf.d (contexto http). Variáveis ${...} vêm do ambiente do container.
+
+upstream backend {
+    # várias instâncias stateless; uma que falhe sai da rotação por 10 s
+    server backend1:8000 max_fails=2 fail_timeout=10s;
+    server backend2:8000 max_fails=2 fail_timeout=10s;
+    keepalive 16;
+}
+
+# limites por IP (valem entre todas as instâncias do backend)
+limit_req_zone $binary_remote_addr zone=auth:10m rate=30r/m;
+limit_req_zone $binary_remote_addr zone=voto:10m rate=60r/m;
+limit_req_zone $binary_remote_addr zone=api:10m  rate=240r/m;
+limit_req_status 429;
+limit_conn_zone $binary_remote_addr zone=conn:10m;
+
+server_tokens off;
+
+server {
+    listen 80;
+    server_name _;
+    return 301 https://$host:${HTTPS_PORT}$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name _;
+
+    ssl_certificate     /etc/nginx/certs/server.crt;
+    ssl_certificate_key /etc/nginx/certs/server.key;
+    ssl_protocols TLSv1.3;                 # TLS 1.3 obrigatório
+    ssl_prefer_server_ciphers off;
+    ssl_session_timeout 1h;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_tickets off;
+
+    client_max_body_size 16k;
+    client_body_timeout 10s;
+    client_header_timeout 10s;
+    limit_conn conn 50;
+
+    include /etc/nginx/seguranca.conf;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" always;
+
+    root /usr/share/nginx/html;
+
+    location /assets/ {
+        include /etc/nginx/seguranca.conf;
+        add_header Content-Security-Policy "default-src 'self'" always;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        try_files $uri =404;
+    }
+
+    location / {
+        add_header Cache-Control "no-store" always;
+        include /etc/nginx/seguranca.conf;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" always;
+        try_files $uri /index.html;
+    }
+
+    location /api/auth/ {
+        limit_req zone=auth burst=20 nodelay;
+        include /etc/nginx/proxy_api.conf;
+    }
+
+    location /api/votacao/ {
+        limit_req zone=voto burst=30 nodelay;
+        include /etc/nginx/proxy_api.conf;
+    }
+
+    # documentação OpenAPI (Swagger UI carrega scripts do jsDelivr: CSP própria só para estas rotas)
+    location ~ ^/api/(docs|redoc|openapi\.json)$ {
+        limit_req zone=api burst=20 nodelay;
+        include /etc/nginx/seguranca.conf;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https://fastapi.tiangolo.com; frame-ancestors 'none'" always;
+        include /etc/nginx/proxy_api.conf;
+    }
+
+    location /api/ {
+        limit_req zone=api burst=60 nodelay;
+        include /etc/nginx/proxy_api.conf;
+    }
+}
